@@ -26,6 +26,9 @@ pip install -r requirements.txt
 pip install flash_attn==2.7.3
 ```
 
+On macOS machines with Apple silicon, install the MPS-enabled build of PyTorch. The provided scripts will automatically use the
+`mps` device when available.
+
 ## Model Zoo
 
 | Model|Transformers(HF) | ModelScope |

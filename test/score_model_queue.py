@@ -11,6 +11,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import argparse
 
 
+DEVICE = (
+    "cuda" if torch.cuda.is_available() else
+    "mps" if torch.backends.mps.is_available() else
+    "cpu"
+)
+
+
 parser = argparse.ArgumentParser(description="Run reward model API")
 parser.add_argument("--model_path", type=str, default='path/to/train_models')
 parser.add_argument("--score_model_dim", type=int, default=1536)
@@ -105,11 +112,13 @@ class ScoreModel:
     def __init__(self, model_path, score_model_path, score_model_dim=1536):
         self.score_model_dim = score_model_dim
         logger.info("Loading LLM and tokenizer...")
+        attn_impl = "flash_attention_2" if DEVICE == "cuda" else "sdpa"
+        dtype = torch.float16 if DEVICE != "cpu" else torch.float32
         self.llm = AutoModelForCausalLM.from_pretrained(
-            model_path, device_map='auto',
-            attn_implementation="flash_attention_2",
-            torch_dtype=torch.float16
-        )
+            model_path,
+            attn_implementation=attn_impl,
+            torch_dtype=dtype,
+        ).to(DEVICE)
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         self.think_start_id = self.tokenizer.encode('<think>', add_special_tokens=False)[0]
         self.think_end_id = self.tokenizer.encode('</think>', add_special_tokens=False)[0]
@@ -126,7 +135,7 @@ class ScoreModel:
         )
         state_dict = torch.load(score_model_path, map_location='cpu')
         model.load_state_dict(state_dict)
-        model.eval().to(self.llm.device).to(self.llm.dtype)
+        model.eval().to(DEVICE).to(self.llm.dtype)
         return model
 
     def __call__(self, text, return_all_scores=False):
@@ -136,7 +145,7 @@ class ScoreModel:
                 text,
                 return_tensors="pt",
                 add_special_tokens=False
-            ).to(self.llm.device)
+            ).to(DEVICE)
             # logger.info(f"Input: {text}")
             output = self.llm(**new_input, output_hidden_states=True)
             feature = output.hidden_states[-2]
@@ -161,7 +170,10 @@ class ScoreModel:
                 logger.info(f"{text}")
             logger.info(f"Score: {value}")
             del new_input, output, feature
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            elif torch.backends.mps.is_available():
+                torch.mps.empty_cache()
 
             if return_all_scores:
                 all_scores = pred_score.detach().cpu().numpy().flatten().tolist()
@@ -200,9 +212,12 @@ async def get_score(input: TextInput):
                     response_future.set_result({"value": result})
                 return
             except RuntimeError as e:
-                if "CUDA out of memory" in str(e):
-                    logger.warning(f"CUDA OOM on attempt {attempt + 1}")
-                    torch.cuda.empty_cache()
+                if "out of memory" in str(e).lower():
+                    logger.warning(f"{DEVICE.upper()} OOM on attempt {attempt + 1}")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    elif torch.backends.mps.is_available():
+                        torch.mps.empty_cache()
                     await asyncio.sleep(0.5)
                     continue
                 else:
@@ -216,7 +231,7 @@ async def get_score(input: TextInput):
 
         logger.error("Max retry exceeded")
         response_future.set_result({
-            "error": "CUDA out of memory even after retrying. Please try again later."
+            "error": f"{DEVICE.upper()} out of memory even after retrying. Please try again later."
         })
 
     await task_queue.put(inference_task)
