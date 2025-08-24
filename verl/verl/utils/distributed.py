@@ -16,13 +16,16 @@ import os
 
 
 def initialize_global_process_group(timeout_second=36000):
+    import torch
     import torch.distributed
     from datetime import timedelta
-    torch.distributed.init_process_group('nccl', timeout=timedelta(seconds=timeout_second))
-    local_rank = int(os.environ["LOCAL_RANK"])
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
 
-    if torch.distributed.is_initialized():
+    backend = 'nccl' if torch.cuda.is_available() else 'gloo'
+    torch.distributed.init_process_group(backend, timeout=timedelta(seconds=timeout_second))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+    if torch.distributed.is_initialized() and torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
     return local_rank, rank, world_size

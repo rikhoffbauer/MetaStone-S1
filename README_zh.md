@@ -23,6 +23,8 @@ pip install -r requirements.txt
 pip install flash_attn==2.7.3
 ```
 
+在搭载 Apple Silicon 的 macOS 设备上，请安装支持 MPS 的 PyTorch 版本，脚本会在可用时自动使用 `mps` 设备。
+
 ## 模型下载
 
 | Model|Transformers(HF) | ModelScope |

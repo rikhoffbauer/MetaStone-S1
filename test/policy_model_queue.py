@@ -1,7 +1,6 @@
 import os
 import time
 import torch
-import torch.nn as nn
 import numpy as np
 import asyncio
 import logging
@@ -10,9 +9,17 @@ from fastapi.responses import JSONResponse
 from starlette.status import HTTP_403_FORBIDDEN
 from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from vllm import LLM, SamplingParams
+if torch.cuda.is_available():
+    from vllm import LLM, SamplingParams
 import argparse
 import copy
+
+
+DEVICE = (
+    "cuda" if torch.cuda.is_available() else
+    "mps" if torch.backends.mps.is_available() else
+    "cpu"
+)
 
 
 parser = argparse.ArgumentParser(description="Run policy model API")
@@ -68,31 +75,59 @@ class TextInput(BaseModel):
 # ============ 推理主逻辑 ============
 class QwenVLLM:
     def __init__(self, model, temperature=0.8, top_p=0.95, max_tokens=32768, repetition_penalty=1.05, gpu_memory_utilization=0.8):
-        print(f"Initializing vLLM on GPU {os.environ.get('CUDA_VISIBLE_DEVICES', '0')}")
-        gpu_num = len(os.environ.get('CUDA_VISIBLE_DEVICES', '0').split(','))
-        self.vllm = LLM(model=model, gpu_memory_utilization=gpu_memory_utilization, dtype=torch.bfloat16, tensor_parallel_size=gpu_num)
-        self.tokenizer = AutoTokenizer.from_pretrained(model)
-        self.tokenizer.padding_side = "left"
+        self.device = DEVICE
         self.temperature = temperature
-        self.sampling_params = SamplingParams(temperature=temperature, top_p=top_p, repetition_penalty=repetition_penalty)
-    
+        self.top_p = top_p
+        self.repetition_penalty = repetition_penalty
+        if self.device == "cuda":
+            print(f"Initializing vLLM on GPU {os.environ.get('CUDA_VISIBLE_DEVICES', '0')}")
+            gpu_num = len(os.environ.get('CUDA_VISIBLE_DEVICES', '0').split(','))
+            self.vllm = LLM(model=model, gpu_memory_utilization=gpu_memory_utilization, dtype=torch.bfloat16, tensor_parallel_size=gpu_num)
+            self.tokenizer = AutoTokenizer.from_pretrained(model)
+            self.tokenizer.padding_side = "left"
+            self.sampling_params = SamplingParams(temperature=temperature, top_p=top_p, repetition_penalty=repetition_penalty)
+        else:
+            print(f"Initializing HF model on {self.device}")
+            dtype = torch.float16 if self.device != "cpu" else torch.float32
+            self.model = AutoModelForCausalLM.from_pretrained(model, torch_dtype=dtype).to(self.device)
+            self.tokenizer = AutoTokenizer.from_pretrained(model)
+            self.tokenizer.padding_side = "left"
+            self.sampling_params = None
+
     def __call__(self, prefix_prompt, max_tokens=1024, response_num=8, stop=None, temperature=None, seed=None):
-        current_samling_params = copy.deepcopy(self.sampling_params)
-        current_samling_params.max_tokens = max_tokens
-        current_samling_params.stop = stop if stop else [] 
-        current_samling_params.include_stop_str_in_output = True
-        current_samling_params.n = response_num
-        current_samling_params.best_of = response_num
-        if temperature:
-            current_samling_params.temperature = temperature
-        if seed:
-            current_samling_params.seed = seed
-        current_samling_params.return_hidden_states=False
-        # outputs = self.vllm.generate([prefix_prompt]*response_num, current_samling_params, use_tqdm=False)
-        # generated_texts = [output.outputs[0].text for output in outputs]
-        outputs = self.vllm.generate(prefix_prompt, current_samling_params, use_tqdm=False)
-        generated_texts = [res.text for res in outputs[0].outputs]
-        return generated_texts
+        if self.device == "cuda":
+            current_samling_params = copy.deepcopy(self.sampling_params)
+            current_samling_params.max_tokens = max_tokens
+            current_samling_params.stop = stop if stop else []
+            current_samling_params.include_stop_str_in_output = True
+            current_samling_params.n = response_num
+            current_samling_params.best_of = response_num
+            if temperature:
+                current_samling_params.temperature = temperature
+            if seed:
+                current_samling_params.seed = seed
+            current_samling_params.return_hidden_states=False
+            outputs = self.vllm.generate(prefix_prompt, current_samling_params, use_tqdm=False)
+            generated_texts = [res.text for res in outputs[0].outputs]
+            return generated_texts
+        else:
+            if seed is not None:
+                torch.manual_seed(seed)
+            temp = temperature if temperature is not None else self.temperature
+            inputs = self.tokenizer(prefix_prompt, return_tensors="pt").to(self.device)
+            outputs = self.model.generate(
+                **inputs,
+                do_sample=True,
+                top_p=self.top_p,
+                temperature=temp,
+                max_new_tokens=max_tokens,
+                num_return_sequences=response_num,
+                pad_token_id=self.tokenizer.eos_token_id,
+                repetition_penalty=self.repetition_penalty,
+            )
+            generated = outputs[:, inputs["input_ids"].shape[-1]:]
+            texts = self.tokenizer.batch_decode(generated, skip_special_tokens=True)
+            return texts
 
 
 # ============ 加载模型 ============
@@ -123,14 +158,20 @@ async def get_generate(input: TextInput):
                 })
                 return
             except RuntimeError as e:
-                if "CUDA out of memory" in str(e):
-                    logger.warning(f"CUDA OOM on attempt {attempt + 1}")
-                    torch.cuda.empty_cache()
+                if "out of memory" in str(e).lower():
+                    logger.warning(f"{DEVICE.upper()} OOM on attempt {attempt + 1}")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    elif torch.backends.mps.is_available():
+                        torch.mps.empty_cache()
                     await asyncio.sleep(0.5)
                     continue
                 else:
                     logger.exception("Runtime error")
-                    torch.cuda.empty_cache()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    elif torch.backends.mps.is_available():
+                        torch.mps.empty_cache()
                     await asyncio.sleep(0.5)
                     continue
             except Exception as e:
@@ -140,7 +181,7 @@ async def get_generate(input: TextInput):
 
         logger.error("Max retry exceeded")
         response_future.set_result({
-            "error": "CUDA out of memory even after retrying. Please try again later."
+            "error": f"{DEVICE.upper()} out of memory even after retrying. Please try again later."
         })
 
     await task_queue.put(inference_task)
